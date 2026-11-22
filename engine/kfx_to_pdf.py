@@ -525,13 +525,16 @@ def _epub_bytes_to_pdf(epub_bytes: bytes, out_pdf_path: Path) -> bool:
     )
 
     # 5. Custom url_fetcher: resolves epub-internal: URLs against the zip
-    def epub_url_fetcher(url):
-        # WeasyPrint expects a dict: {'string': bytes, 'mime_type': str}
+    def epub_url_fetcher(url, *_args, **_kwargs):
+        return _fetcher_result(url, *_resolve_epub_url(url))
+
+    def _resolve_epub_url(url):
+        """(bytes, mime type) for an epub-internal: URL; empty for anything else."""
         if not url.startswith("epub-internal:"):
             # External URL — refuse to fetch (security: don't let books make
             # network requests). Return empty so WeasyPrint silently skips it.
             log.debug("Refusing external URL: %s", url)
-            return {"string": b"", "mime_type": "application/octet-stream"}
+            return b"", "application/octet-stream"
 
         path = url[len("epub-internal:"):]
         # URLs may have query strings or fragments
@@ -549,15 +552,15 @@ def _epub_bytes_to_pdf(epub_bytes: bytes, out_pdf_path: Path) -> bool:
                     break
         if not resolved:
             log.debug("EPUB resource not found: %s", path)
-            return {"string": b"", "mime_type": "application/octet-stream"}
+            return b"", "application/octet-stream"
 
         try:
             data = zf.read(resolved)
         except KeyError:
-            return {"string": b"", "mime_type": "application/octet-stream"}
+            return b"", "application/octet-stream"
 
         mime = _guess_mime(resolved)
-        return {"string": data, "mime_type": mime}
+        return data, mime
 
     log.info("Rendering %d chapters via WeasyPrint", len(chapters_html))
 
@@ -684,6 +687,18 @@ def _rewrite_resource_urls(html: str, chapter_dir: str) -> str:
         _rewrite,
         html,
     )
+
+
+def _fetcher_result(url: str, data: bytes, mime: str):
+    """
+    What a WeasyPrint url_fetcher must return. WeasyPrint 70+ only accepts a
+    URLFetcherResponse; older versions take a {'string', 'mime_type'} dict.
+    """
+    try:
+        from weasyprint.urls import URLFetcherResponse
+    except ImportError:
+        return {"string": data, "mime_type": mime}
+    return URLFetcherResponse(url, body=data, headers={"Content-Type": mime})
 
 
 def _guess_mime(path: str) -> str:

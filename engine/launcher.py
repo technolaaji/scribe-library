@@ -9,7 +9,7 @@ the window, the Python process shuts down (Flask thread is daemonized).
 This is the entry point for a packaged macOS .app bundle, but it also works
 as a normal Python script for development:
 
-    python3 launcher.py
+    npm run build && python3 engine/launcher.py
 
 Design notes:
   - Flask runs in a thread, not a subprocess, so we get a single .app bundle
@@ -63,7 +63,7 @@ def get_library_root() -> Path:
     Where the library folder lives.
 
     - Bundled app: ~/Library/Application Support/Scribe Library/library/
-    - Dev mode:   <repo>/library/  (next to launcher.py)
+    - Dev mode:   <repo>/library/
 
     Trying to write inside the .app bundle would either fail or pollute
     the user's app, so we always use a per-user data directory in bundle mode.
@@ -77,8 +77,8 @@ def get_library_root() -> Path:
             )) / "scribe-library"
         return base / "library"
 
-    # Dev mode: alongside this script
-    return Path(__file__).resolve().parent / "library"
+    # Dev mode: <repo>/library (launcher.py lives in <repo>/engine)
+    return Path(__file__).resolve().parent.parent / "library"
 
 
 def get_resource_path(name: str) -> Path:
@@ -110,6 +110,7 @@ def configure_server() -> "tuple[object, int]":
     # Wire the server's globals — it normally derives these from CLI args
     scribe_server.LIBRARY_ROOT = library_root
     scribe_server.PATHS = scribe_server.init_library(library_root)
+    scribe_server.REGISTRY = scribe_server.init_registry(scribe_server.PATHS)
 
     port = find_free_port()
     log.info("Will bind to port %d", port)

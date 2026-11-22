@@ -1,5 +1,33 @@
-.claude/
+# python
 __pycache__/
-library/
 .venv/
+
+# your synced Kindle content and the registry database
+library/
+# the registry and any other local databases, wherever --library points
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-journal
+# synced books and notebooks, if ever copied outside library/
+*.kfx
+*.azw
+*.azw3
+*.azw8
+*.nbk
+*.yjr
+*.yjf
+
+# node / next.js
+/node_modules
+/.next/
+/out/
+*.tsbuildinfo
+next-env.d.ts
+
+# misc
+.claude/
 .DS_Store
+.env
+npm-debug.log*

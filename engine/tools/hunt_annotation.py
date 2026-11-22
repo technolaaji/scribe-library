@@ -28,7 +28,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-_THIS_DIR = Path(__file__).resolve().parent
+_THIS_DIR = Path(__file__).resolve().parent.parent  # engine/
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 

@@ -31,11 +31,17 @@ extraction is slow — ~1s per book).
 import hashlib
 import json
 import logging
+import os
 import re
+import threading
 from datetime import datetime
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+# Book covers are fetched in parallel, and each one may write metadata, so
+# read-modify-write of meta.json has to be serialised.
+_META_LOCK = threading.Lock()
 
 UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
@@ -113,9 +119,19 @@ class LibraryPaths:
 
 # ── Discovery ────────────────────────────────────────────────────────────────
 
-def _stable_id(path: Path) -> str:
-    """Short stable hash of a path. Used for URL-safe IDs."""
-    return hashlib.md5(str(path.resolve()).encode()).hexdigest()[:12]
+def _stable_id(path: Path, root: Path | None = None) -> str:
+    """
+    Short stable hash of a path, used for URL-safe IDs. Hashed relative to the
+    library root when given, so IDs (and the registry rows keyed on them)
+    survive moving the library folder.
+    """
+    p = path.resolve()
+    if root is not None:
+        try:
+            p = p.relative_to(Path(root).resolve())
+        except ValueError:
+            pass
+    return hashlib.md5(str(p).encode()).hexdigest()[:12]
 
 
 def discover_screenshots(paths: LibraryPaths) -> list[dict]:
@@ -145,7 +161,7 @@ def discover_screenshots(paths: LibraryPaths) -> list[dict]:
         captured = _parse_screenshot_timestamp(img.name) or stat.st_mtime
         items.append({
             "kind": "screenshot",
-            "id": _stable_id(img),
+            "id": _stable_id(img, paths.root),
             "name": img.name,
             "filename": img.name,
             "path": str(img),
@@ -200,7 +216,7 @@ def discover_notebooks(paths: LibraryPaths) -> list[dict]:
         thumb = paths.notebooks_dir / f"{nbk.stem}.png"
         items.append({
             "kind": "notebook",
-            "id": _stable_id(nbk),
+            "id": _stable_id(nbk, paths.root),
             "name": uuid or nbk.stem,
             "uuid": uuid,
             "path": str(nbk),
@@ -250,7 +266,7 @@ def discover_books(
             except OSError:
                 continue
 
-            book_id = _stable_id(f)
+            book_id = _stable_id(f, paths.root)
             cached = cache.get(book_id, {})
 
             # Title fallback: use the filename without extension if no
@@ -320,7 +336,7 @@ def load_metadata_cache(paths: LibraryPaths) -> dict:
 def save_metadata_cache(paths: LibraryPaths, cache: dict):
     """Atomically write the metadata cache."""
     paths.books_dir.mkdir(parents=True, exist_ok=True)
-    tmp = paths.meta_path.with_suffix(".tmp")
+    tmp = paths.meta_path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
     tmp.write_text(json.dumps(cache, indent=2, sort_keys=True))
     tmp.replace(paths.meta_path)
 
@@ -329,14 +345,15 @@ def update_book_metadata(paths: LibraryPaths, book_id: str,
                          title: str | None, authors: list[str] | None,
                          has_cover: bool):
     """Record metadata for one book in the cache."""
-    cache = load_metadata_cache(paths)
-    cache[book_id] = {
-        "title": title,
-        "authors": authors or [],
-        "has_cover": has_cover,
-        "updated": datetime.utcnow().isoformat(),
-    }
-    save_metadata_cache(paths, cache)
+    with _META_LOCK:
+        cache = load_metadata_cache(paths)
+        cache[book_id] = {
+            "title": title,
+            "authors": authors or [],
+            "has_cover": has_cover,
+            "updated": datetime.utcnow().isoformat(),
+        }
+        save_metadata_cache(paths, cache)
 
 
 # ── Classification helpers used by the MTP sync ──────────────────────────────

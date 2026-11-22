@@ -31,6 +31,7 @@ Usage:
 
 import logging
 import re
+import os
 import struct
 import sys
 from dataclasses import dataclass, field
@@ -178,17 +179,34 @@ def _parse_object_info(data):
     try:
         storage_id, fmt, protection, size = struct.unpack_from('<IHHI', payload, 0)
         parent_id = struct.unpack_from('<I', payload, 28)[0]
-        filename, _ = _read_mtp_string(payload, 52)
+        filename, off = _read_mtp_string(payload, 52)
+        _captured, off = _read_mtp_string(payload, off)
+        modified_raw, _ = _read_mtp_string(payload, off)
         return {
             'storage_id': storage_id,
             'format': fmt,
             'size': size,
             'parent_id': parent_id,
             'filename': filename,
+            'modified': _parse_mtp_date(modified_raw),
         }
     except Exception as e:
         log.debug(f"parse_object_info error: {e}")
         return {}
+
+
+def _parse_mtp_date(raw):
+    """
+    MTP dates look like '20261122T205849.' (optionally with tenths and a 'Z').
+    The Kindle reports device-local time. Returns a unix timestamp or None.
+    """
+    if not raw or len(raw) < 15:
+        return None
+    try:
+        from datetime import datetime as _dt
+        return _dt.strptime(raw[:15], "%Y%m%dT%H%M%S").timestamp()
+    except ValueError:
+        return None
 
 
 def _write_mtp_string(s):
@@ -646,8 +664,8 @@ class MTPDevice:
         The UUID folder name is the parent directory of the nbk file. The
         thumbnail stem is the filename without ".png".
         """
-        notebooks: list[tuple[int, str, int, str | None]] = []
-        thumbnails: list[tuple[int, str, int, str]] = []
+        notebooks: list[tuple[int, str, int, str | None, float | None]] = []
+        thumbnails: list[tuple[int, str, int, str, float | None]] = []
 
         storage_ids = self.get_storage_ids()
         log_fn(f"  Storages: {len(storage_ids)}")
@@ -694,15 +712,19 @@ class MTPDevice:
                     is_thumb_folder = name_lower == 'thumbnails'
                     is_uuid = bool(UUID_RE.match(name))
                     is_known_root = name_lower in TARGET_DIRS
+                    # "<ASIN>!!EBOK!!notebook" / "<id>!!PDOC!!notebook" hold the
+                    # handwriting written *inside a book* (margin notes,
+                    # handwritten sticky notes). We pull them so the book
+                    # viewer can show them at their position.
+                    is_in_book = name_lower.endswith('!!notebook')
 
                     should_recurse = (
                         depth == 0
                         or is_known_root
                         or is_uuid
                         or is_thumb_folder
+                        or is_in_book
                         or (depth == 1
-                            and not name_lower.endswith('!!ebok!!notebook')
-                            and not name_lower.endswith('!!pdoc!!notebook')
                             and name_lower not in {'clipboard', 'page_cache',
                                                    '.backups', 'screenshots',
                                                    'audible', 'system'})
@@ -724,7 +746,8 @@ class MTPDevice:
                         stem = name[:-len('.png')]
                         if UUID_RE.match(stem):
                             log_fn(f"  {'  ' * depth}  ✓ thumbnail for {stem}")
-                            thumbnails.append((handle, name, size, stem))
+                            thumbnails.append((handle, name, size, stem,
+                                               info.get('modified')))
                         continue
 
                     # Notebook database file: literally named "nbk".
@@ -734,12 +757,14 @@ class MTPDevice:
                         # the UUID pattern.
                         folder_name = next(
                             (p for p in reversed(path_parts[:-1])
-                             if UUID_RE.match(p)),
+                             if UUID_RE.match(p)
+                             or p.lower().endswith('!!notebook')),
                             None,
                         )
                         display = folder_name or name
                         log_fn(f"  {'  ' * depth}  ✓ notebook (will save as {display}.nbk)")
-                        notebooks.append((handle, name, size, folder_name))
+                        notebooks.append((handle, name, size, folder_name,
+                                          info.get('modified')))
 
         for sid in storage_ids:
             log_fn(f"  Storage 0x{sid:08x}:")
@@ -865,6 +890,7 @@ class MTPDevice:
                         'storage_id': storage_id,
                         'filename': name,
                         'size': size,
+                        'modified': info.get('modified'),
                         'subdir': subdir,
                         'is_annotation': in_sdr,
                     })
@@ -892,7 +918,7 @@ class MTPDevice:
 
         for sid in storage_ids:
             try:
-                handles = self.get_object_handles(sid, HANDLE_ROOT)
+                handles = self._screenshot_handles(sid)
             except Exception as e:
                 log_fn(f"  Warning: storage 0x{sid:08x}: {e}")
                 continue
@@ -927,6 +953,19 @@ class MTPDevice:
 
         return screenshots
 
+    def _screenshot_handles(self, storage_id):
+        """
+        Handles of every object where screenshots can live: the drive root
+        (older firmware) and a top-level screenshots/ folder (newer firmware).
+        """
+        handles = list(self.get_object_handles(storage_id, HANDLE_ROOT))
+        for h in list(handles):
+            info = self.get_object_info(h)
+            if (info.get('format') == FMT_ASSOCIATION
+                    and info.get('filename', '').lower() == 'screenshots'):
+                handles += self.get_object_handles(storage_id, h)
+        return handles
+
     def find_object_by_filename(self, filename, log_fn=print):
         """
         Re-scan every storage's root looking for a file with this exact
@@ -939,7 +978,7 @@ class MTPDevice:
         storage_ids = self.get_storage_ids()
         for sid in storage_ids:
             try:
-                handles = self.get_object_handles(sid, HANDLE_ROOT)
+                handles = self._screenshot_handles(sid)
             except Exception as e:
                 log_fn(f"  Warning: storage 0x{sid:08x}: {e}")
                 continue
@@ -1019,10 +1058,32 @@ def _find_kindle_usb():
     return devices[0] if devices else None
 
 
-def _needs_copy(dest, size):
+def _needs_copy(dest, size, modified=None):
+    """
+    True when the local copy is missing or differs from the device's file.
+
+    Size alone misses edits that rewrite pages in place (a notebook's SQLite
+    file often keeps its size), so we also compare the device's modification
+    time, which we stamp onto the local copy after every download.
+    """
     if not dest.exists():
         return True
-    return dest.stat().st_size != size
+    st = dest.stat()
+    if st.st_size != size:
+        return True
+    if modified is not None and abs(st.st_mtime - modified) > 2:
+        return True
+    return False
+
+
+def _stamp_mtime(dest, modified):
+    """Give the local copy the device's modification time."""
+    if modified is None:
+        return
+    try:
+        os.utime(dest, (modified, modified))
+    except OSError:
+        pass
 
 
 def sync_notebooks(dest, log=None, force=False):
@@ -1098,11 +1159,18 @@ def sync_notebooks(dest, log=None, force=False):
              f"and {len(thumbnails)} thumbnail(s)…")
 
         # 1. Notebooks: <UUID>.nbk (or filename if no UUID was found).
-        for handle, filename, size, folder_name in notebooks:
-            save_name = f"{folder_name}.nbk" if folder_name else filename
-            dst = dest / save_name
+        in_book_dir = dest / "in-book"
+        for handle, filename, size, folder_name, modified in notebooks:
+            if folder_name and folder_name.lower().endswith('!!notebook'):
+                # Handwriting inside a book: keyed by the book's ASIN/id.
+                in_book_dir.mkdir(parents=True, exist_ok=True)
+                save_name = f"{folder_name.split('!!')[0]}.nbk"
+                dst = in_book_dir / save_name
+            else:
+                save_name = f"{folder_name}.nbk" if folder_name else filename
+                dst = dest / save_name
 
-            if not force and not _needs_copy(dst, size):
+            if not force and not _needs_copy(dst, size, modified):
                 _log(f"  ✓ {save_name} — up to date")
                 report.notebooks_skipped += 1
                 report.local_paths.append(dst)
@@ -1120,6 +1188,7 @@ def sync_notebooks(dest, log=None, force=False):
 
             try:
                 mtp.get_object(handle, dst, progress_cb=progress)
+                _stamp_mtime(dst, modified)
                 report.notebooks_copied += 1
                 report.local_paths.append(dst)
                 _log(f"  ✓ Saved → {dst}")
@@ -1130,12 +1199,13 @@ def sync_notebooks(dest, log=None, force=False):
 
         # 2. Thumbnails: <UUID>.png. We're less strict here — if a thumbnail
         # fails to copy we just log and move on.
-        for handle, filename, size, stem in thumbnails:
+        for handle, filename, size, stem, modified in thumbnails:
             dst = dest / f"{stem}.png"
-            if not force and not _needs_copy(dst, size):
+            if not force and not _needs_copy(dst, size, modified):
                 continue
             try:
                 mtp.get_object(handle, dst)
+                _stamp_mtime(dst, modified)
                 report.thumbnails_copied += 1
                 _log(f"  ✓ thumbnail → {dst.name}")
             except Exception as e:
@@ -1269,7 +1339,8 @@ def sync_books(dest, log=None, force=False, purchased_subdir="purchased",
             safe_name = safe_local_filename(book['filename'])
             dst = target_dir / safe_name
 
-            if not force and not _needs_copy(dst, book['size']):
+            if not force and not _needs_copy(dst, book['size'],
+                                             book.get('modified')):
                 _log(f"  ✓ {classification:>10s}: {safe_name} — up to date")
                 report.books_skipped += 1
                 report.local_paths.append(dst)
@@ -1288,6 +1359,7 @@ def sync_books(dest, log=None, force=False, purchased_subdir="purchased",
 
             try:
                 mtp.get_object(book['handle'], dst, progress_cb=progress)
+                _stamp_mtime(dst, book.get('modified'))
                 report.books_copied += 1
                 report.local_paths.append(dst)
                 _log(f"  ✓ Saved → {dst.relative_to(dest)}")
